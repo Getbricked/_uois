@@ -20,3 +20,5 @@ pytest-cov
 pytest-asyncio
 aiosqlite
 gevent
+
+dotenv

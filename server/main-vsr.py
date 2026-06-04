@@ -1,0 +1,490 @@
+import logging
+import os
+import asyncio
+import aiohttp
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, RedirectResponse, HTMLResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from contextlib import asynccontextmanager
+
+from mockoauthserver import server as OAuthServer
+
+from .users import (
+    ComposeConnectionString,
+    startEngine,
+    initDB,
+    getDemoData,
+    passwordValidator,
+    emailMapper,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s.%(msecs)03d\t%(levelname)s:\t%(message)s",
+    datefmt="%Y-%m-%dT%I:%M:%S",
+)
+
+
+# region DB setup
+
+## Definice GraphQL typu (pomoci strawberry https://strawberry.rocks/)
+## Strawberry zvoleno kvuli moznosti mit federovane GraphQL API (https://strawberry.rocks/docs/guides/federation, https://www.apollographql.com/docs/federation/)
+## Definice DB typu (pomoci SQLAlchemy https://www.sqlalchemy.org/)
+## SQLAlchemy zvoleno kvuli moznost komunikovat s DB asynchronne
+## https://docs.sqlalchemy.org/en/14/core/future.html?highlight=select#sqlalchemy.future.select
+
+
+## Zabezpecuje prvotni inicializaci DB a definovani Nahodne struktury pro "Univerzity"
+# from gql_workflow.DBFeeder import createSystemDataStructureRoleTypes, createSystemDataStructureGroupTypes
+
+connectionString = ComposeConnectionString()
+
+
+def singleCall(asyncFunc):
+    """Dekorator, ktery dovoli, aby dekorovana funkce byla volana (vycislena) jen jednou. Navratova hodnota je zapamatovana a pri dalsich volanich vracena.
+    Dekorovana funkce je asynchronni.
+    """
+    resultCache = {}
+
+    async def result():
+        if resultCache.get("result", None) is None:
+            resultCache["result"] = await asyncFunc()
+        return resultCache["result"]
+
+    return result
+
+
+@singleCall
+async def RunOnceAndReturnSessionMaker():
+    """Provadi inicializaci asynchronniho db engine, inicializaci databaze a vraci asynchronni SessionMaker.
+    Protoze je dekorovana, volani teto funkce se provede jen jednou a vystup se zapamatuje a vraci se pri dalsich volanich.
+    """
+
+    makeDrop = os.getenv("DEMO", None) in ["True", True]
+    logging.info(f'starting engine for "{connectionString} makeDrop={makeDrop}"')
+
+    asyncSessionMaker = await startEngine(
+        connectionstring=connectionString, makeDrop=makeDrop, makeUp=True
+    )
+
+    logging.info(f"initializing system structures")
+
+    asyncio.create_task(initDB(asyncSessionMaker))
+    # await initDB(asyncSessionMaker)
+
+    logging.info(f"all done")
+    return asyncSessionMaker
+
+
+# endregion
+
+
+DEMO = os.getenv("DEMO", None)
+assert DEMO is not None, "DEMO environment variable must be explicitly defined"
+assert (DEMO == "True") or (
+    DEMO == "False"
+), "DEMO environment variable can have only `True` or `False` values"
+DEMO = DEMO == "True"
+
+if DEMO:
+    print("####################################################")
+    print("#                                                  #")
+    print("# RUNNING IN DEMO                                  #")
+    print("#                                                  #")
+    print("####################################################")
+
+    logging.info("####################################################")
+    logging.info("#                                                  #")
+    logging.info("# RUNNING IN DEMO                                  #")
+    logging.info("#                                                  #")
+    logging.info("####################################################")
+
+
+# app = FastAPI(root_path="/apif")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    initizalizedEngine = await RunOnceAndReturnSessionMaker()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+from .appindex import createIndexResponse
+
+# @app.exception_handler(StarletteHTTPException)
+# async def custom_http_exception_handler(request, exc):
+#     print(exc)
+#     return await createIndexResponse(request=request)
+
+from uoishelpers.authenticationMiddleware import (
+    BasicAuthenticationMiddleware302,
+    BasicAuthBackend,
+)
+
+# prepiseme BasicAuthBackend pomoci plneho 4. fazoveho, ten zabezpeci funkcnot pri zrusenem tokenu
+from .BasicAuthBackend4Phase import BasicAuthBackend4Phase as BasicAuthBackend
+
+from vsr.vsr_auth import HybridAuthBackend, VSRPolicyMiddleware
+
+JWTPUBLICKEY = os.environ.get("JWTPUBLICKEY", "http://localhost:8000/oauth/publickey")
+JWTRESOLVEUSERPATH = os.environ.get(
+    "JWTRESOLVEUSERPATH", "http://localhost:8000/oauth/userinfo"
+)
+
+
+from prometheus_fastapi_instrumentator import Instrumentator
+
+Instrumentator().instrument(app, metric_namespace="frontnend").expose(
+    app, endpoint="/metrics"
+)
+
+import json
+
+#######################################################################
+#
+# pouziti html jako SPA - single page applications
+# predpoklada se, ze html maji integrovany router (react-router)
+# a ze si obslouzi zbytek cesty
+# aplikace jsou chraneny autentizaci
+#
+#######################################################################
+configFile = "config.json"
+dirName = ""
+if __file__:
+    dirName = os.path.dirname(__file__)
+
+print("executing in", dirName)
+
+configFile = dirName + "/" + configFile
+
+
+def createApp(key, setup):
+    file = setup["file"]
+    print(f"creating sub app {key} with setup {setup}")
+    subApp = FastAPI()
+
+    @subApp.get("/{file_path:path}")
+    async def getFile(file_path: str):
+        filename = dirName + "/htmls/" + file
+        print(f"serving app {file} from `{filename}`")
+        if os.path.isfile(filename):
+            return FileResponse(filename)
+        else:
+            return RedirectResponse("/")
+
+    subApp.add_middleware(
+        BasicAuthenticationMiddleware302,
+        backend=HybridAuthBackend(
+            original_backend=(
+                BasicAuthBackend(
+                    JWTPUBLICKEY=JWTPUBLICKEY, JWTRESOLVEUSERPATH=JWTRESOLVEUSERPATH
+                )
+                if not DEMO
+                else None
+            )
+        ),
+    )
+    subApp.add_middleware(VSRPolicyMiddleware)
+    app.mount("/" + key, subApp)
+
+
+with open(configFile, "r", encoding="utf-8") as f:
+    config = json.load(f)
+    print(f"app config set to\n{config}")
+    for key, setup in config.items():
+        createApp(key, setup)
+
+
+@app.get("/logout")
+def logout():
+    result = RedirectResponse("/oauth/login2?redirect_uri=/", status_code=303)
+    result.delete_cookie("authorization")
+    return result
+
+
+#######################################################################
+#
+# tato cast je pro FAKE autentizaci
+# poskytuje autentizacni (prihlasovaci stranku)
+# ma volny pristup
+#
+#######################################################################
+demoData = getDemoData()
+users = demoData.get("users", [])
+
+
+async def bindedPasswordValidator(email, password):
+    asyncSessionMaker = await RunOnceAndReturnSessionMaker()
+    result = await passwordValidator(asyncSessionMaker, email, password)
+    logging.info(f"check for {email} & {password} -> {result}")
+    return result
+
+
+async def bindedEmailMapper(email):
+    asyncSessionMaker = await RunOnceAndReturnSessionMaker()
+    logging.info(f"bindedEmailMapper {email}")
+
+    result = await emailMapper(asyncSessionMaker, email)
+    return result
+
+
+db_users = [{"id": user["id"], "email": user["email"]} for user in users]
+print(f"first user {db_users[0]}", flush=True)
+app.mount(
+    "/oauth",
+    OAuthServer.createServer(
+        db_users=db_users,
+        passwordValidator=bindedPasswordValidator,
+        emailMapper=bindedEmailMapper,
+    ),
+)
+
+#######################################################################
+#
+# tato cast je proxy pro API endpoint
+# je dostupna jen s autentizaci
+#
+#######################################################################
+
+apiApp = FastAPI()
+apiApp.add_middleware(
+    BasicAuthenticationMiddleware302,
+    backend=HybridAuthBackend(
+        original_backend=(
+            BasicAuthBackend(
+                JWTPUBLICKEY=JWTPUBLICKEY, JWTRESOLVEUSERPATH=JWTRESOLVEUSERPATH
+            )
+            if not DEMO
+            else None
+        )
+    ),
+)
+apiApp.add_middleware(VSRPolicyMiddleware)
+app.mount("/api", apiApp)
+
+from .gqlproxy import connectProxy
+
+connectProxy(apiApp)
+
+#######################################################################
+#
+# tato cast je pro debug
+# je dostupna jen s autentizaci
+#
+#######################################################################
+
+debugApp = FastAPI()
+
+
+@debugApp.get("/")
+async def hello(requets: Request):
+    client = requets.client
+    headers = requets.headers
+    cookies = requets.cookies
+    import aiohttp
+    import jwt
+    bearer = cookies.get("authorization")
+    token = bearer.replace("Bearer ", "")
+
+    JWTPUBLICKEYURL="http://locahost:8000/oauth/publickey"
+    JWTPUBLICKEYURL="http://127.0.0.1:8000/oauth/publickey"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(JWTPUBLICKEYURL) as resp:
+            assert resp.status == 200, resp
+            pktext = await resp.text() 
+    print(f"have pktext={pktext}")
+    logging.info(f"have pktext={pktext}")
+    pkey = pktext.replace('"', "").replace("\\n", "\n")
+    jwtdecoded = jwt.decode(jwt=token, key=pkey, algorithms=["RS256"])
+    print(f"jwtdecoded = {jwtdecoded}")
+    logging.info(f"jwtdecoded = {jwtdecoded}")
+    userid = jwtdecoded["user_id"]
+    print(f"userid = {userid}")
+    logging.info(f"userid = {userid}")
+    print(f"SUCCESS")
+    logging.info(f"SUCCESS")
+    return {
+        "hello": "world",
+        "client": client,
+        "headers": headers,
+        "cookies": cookies,
+        "token": token,
+        "publickey": pkey,
+        "jwtdecoded": jwtdecoded,
+        "userid": userid
+        }
+
+
+@debugApp.get("/rsa")
+async def hello_rsa(request: Request):
+    client = request.client
+    headers = request.headers
+    cookies = request.cookies
+    import aiohttp
+    import jwt
+
+    bearer = cookies.get("authorization")
+    token = bearer.replace("Bearer ", "")
+
+    JWTPUBLICKEYURL = "http://locahost:8000/oauth/publickey"
+    JWTPUBLICKEYURL = "http://127.0.0.1:8000/oauth/publickey"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(JWTPUBLICKEYURL) as resp:
+            assert resp.status == 200, resp
+            pktext = await resp.text()
+    print(f"have pktext={pktext}")
+    logging.info(f"have pktext={pktext}")
+    pkey = pktext.replace('"', "").replace("\\n", "\n")
+    jwtdecoded = jwt.decode(jwt=token, key=pkey, algorithms=["RS256"])
+    print(f"jwtdecoded = {jwtdecoded}")
+    logging.info(f"jwtdecoded = {jwtdecoded}")
+    userid = jwtdecoded["user_id"]
+    print(f"userid = {userid}")
+    logging.info(f"userid = {userid}")
+    print(f"SUCCESS")
+    logging.info(f"SUCCESS")
+    return {
+        "hello": "world",
+        "client": client,
+        "headers": headers,
+        "cookies": cookies,
+        "token": token,
+        "publickey": pkey,
+        "jwtdecoded": jwtdecoded,
+        "userid": userid,
+    }
+
+
+debugApp.add_middleware(
+    BasicAuthenticationMiddleware302,
+    backend=HybridAuthBackend(
+        original_backend=(
+            BasicAuthBackend(
+                JWTPUBLICKEY=JWTPUBLICKEY, JWTRESOLVEUSERPATH=JWTRESOLVEUSERPATH
+            )
+            if not DEMO
+            else None
+        )
+    ),
+)
+debugApp.add_middleware(VSRPolicyMiddleware)
+
+app.mount("/debug", debugApp)
+
+genericsApp = FastAPI()
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent  # adresář kde leží tento .py soubor
+DIST_DIR = BASE_DIR / "htmls/dyn"  # např. vedle app.py
+print("DIST_DIR", DIST_DIR)
+INDEX_HTML = DIST_DIR / "index.html"
+
+
+@genericsApp.get("/{full_path:path}")
+async def so(full_path: str):
+    # pokud ten soubor reálně existuje, nech ho obsloužit statikou
+    candidate = DIST_DIR / full_path
+    if candidate.exists() and candidate.is_file():
+        return FileResponse(candidate)
+
+    # jinak vrať index.html (React Router si to převezme)
+    return FileResponse(INDEX_HTML)
+
+
+genericsApp.add_middleware(
+    BasicAuthenticationMiddleware302,
+    backend=HybridAuthBackend(
+        original_backend=(
+            BasicAuthBackend(
+                JWTPUBLICKEY=JWTPUBLICKEY, JWTRESOLVEUSERPATH=JWTRESOLVEUSERPATH
+            )
+            if not DEMO
+            else None
+        )
+    ),
+)
+genericsApp.add_middleware(VSRPolicyMiddleware)
+app.mount("/generic", genericsApp)
+
+
+#######################################################################
+#
+# tato cast je pro index - portal
+# je dostupna jen s autentizaci
+#
+#######################################################################
+
+indexApp = FastAPI()
+
+
+@indexApp.get("/")
+async def index(request: Request):
+    return await createIndexResponse(request=request)
+
+
+indexApp.add_middleware(
+    BasicAuthenticationMiddleware302,
+    backend=HybridAuthBackend(
+        original_backend=(
+            BasicAuthBackend(
+                JWTPUBLICKEY=JWTPUBLICKEY, JWTRESOLVEUSERPATH=JWTRESOLVEUSERPATH
+            )
+            if not DEMO
+            else None
+        )
+    ),
+)
+indexApp.add_middleware(VSRPolicyMiddleware)
+app.mount("/index", indexApp)
+
+#######################################################################
+#
+# tato cast je pro index - portal
+# je dostupna jen s autentizaci
+#
+#######################################################################
+
+analyticsApp = FastAPI()
+
+
+@analyticsApp.get("/{file_path:path}/")
+async def analytics(file_path, request: Request):
+
+    headers = dict(request.headers)
+    query_params = request.query_params
+    fullurl = request.url.include_query_params(**query_params)
+    # print(fullurl)
+    path = request.url.path
+    fulluri = path + f"{fullurl}".split(request.url.path)[1]
+    # fulluri = (request._url)
+    # fulluri = (request.url.path)
+    # print(fulluri)
+    remoteurl = f"http://analytics:8000{fulluri}"
+    # print(remoteurl)
+    try:
+        print("remoteurl", remoteurl)
+        print("headers", headers)
+        del headers["host"]
+        async with aiohttp.ClientSession() as session:
+            async with session.get(remoteurl, headers=headers) as resp:
+                # print(resp.status)
+                text = await resp.text()
+    except Exception as e:
+        print("except", e)
+
+    return HTMLResponse(content=text, status_code=resp.status)
+
+
+app.mount("/analysis", analyticsApp)
+
+#######################################################################
+#
+# tato cast je pro root
+# je dostupna bez autentizace, ale dela jen presmerovani
+#
+#######################################################################
+
+
+@app.get("/")
+async def index(request: Request):
+    return RedirectResponse("/index", status_code=302)
