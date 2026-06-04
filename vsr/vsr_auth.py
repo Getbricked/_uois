@@ -8,8 +8,8 @@ from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=Path(__file__).with_name("key.env"))
 
-VSR_ISSUER = os.getenv("VSR_ISSUER", "https://vsr.local-auth.internal")
-VSR_SECRET = os.getenv("VSR_SECRET", "vsr-local-signing-key-2026")
+VSR_ISSUER = os.getenv("VSR_ISSUER")
+VSR_SECRET = os.getenv("VSR_SECRET")
 
 
 # Extract JWT from cookie or Authorization header

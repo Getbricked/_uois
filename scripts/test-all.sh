@@ -16,6 +16,7 @@ echo ""
 
 echo "===== 4. VSR issuer + bad HMAC ====="
 bash test-bad-signature.sh
+echo ""
 
 echo "===== 5. John Newbie (OAuth RS256) ====="
 bash test-john-newbie.sh

@@ -29,5 +29,4 @@ _extradata
 **/__pycache__
 *.pyc
 **/.pytest_cache
-**/.venv.venv/
-vsr/key.env
+.venv/

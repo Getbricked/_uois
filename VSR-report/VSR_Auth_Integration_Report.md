@@ -56,5 +56,4 @@ Extra test to make sure the original OAuth flow is unaffected (DEMO=False):
 | `_uois/VSR_INTEGRATION.md` | Created — full technical documentation |
 
 ### **Source Code:**
-
-All changes have been published to GitHub: [https://github.com/getbricked/_uois](https://github.com/getbricked/_uois)
+All changes have been published to GitHub: [Github](https://github.com/getbricked/_uois/tree/vsr-ex) (branch: `vsr-ex`).
